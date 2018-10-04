@@ -1,8 +1,8 @@
 #####################################################
 #	Author: Boya Ren @ Infervision
 #	Date: July 19, 2018
-#	Functions: CycleGAN model, training and testing
-#	Last modified: July 20, 2018
+#	Functions: Disentangled representation model
+#	Last modified: Aug 17, 2018
 #####################################################
 
 from __future__ import division
@@ -30,37 +30,44 @@ class CycleGAN(object):
 		self.c_dim = 1
 		self.style_A = args.style_A
 		self.style_B = args.style_B
+		self.style_C = args.style_C
+		self.style_D = ['LDHDStdSS0', 'LDHDStdSS80', 'LDHDLungSS40']
+		self.style_E = args.style_E
 		self.window_center = -400
 		self.window_width = 1500
-		self.has_paired = False
-		self.t_print_every = 100
-		self.v_print_every = 100
-		self.save_every = 1000
-		self.val_seed = 0
-		self.checkpoint_dir = 'checkpoints'
-		self.sample_dir = 'samples'
+		self.has_paired = args.paired
+		self.t_print_every = 50
+		self.v_print_every = 50
+		self.save_every = 100
+		self.val_seed = 12
+		self.checkpoint_dir = args.checkpoint_dir
+		self.sample_dir = args.sample_dir
 		self.out_dir = args.out_path
-		self.from_scratch = True
+		self.from_scratch = args.from_scratch
+		self.num_sup = args.num_supervised
+		self.num_unsup = args.num_unsupervised
 
 		# Model hyper-parameters
-		self.batch_size = 4
-		self.fine_size = 128
-		self.epoch_num = 7
-		self.epoch_size = 1000
-		self.gf_dim = 64
+		self.w_gan = args.w_gan
+		self.w_cc = args.w_cc
+		self.w_c = args.w_c
+		self.w_rec = args.w_rec
+		self.w_trans = args.w_trans
+		self.batch_size = 1
+		self.fine_size = 512
+		self.epoch_num = 500
+		self.epoch_size = 100
+		self.gf_dim = 96
 		self.df_dim = 64
-		self.lambda_cc_loss = 20 #When using mse, suggest setting this to 20, and 2 for abs
-		self.lambda_gp = 5
-		self.lambda_g_loss = 0.2
+		self.lambda_gp = 10
+		self.lambda_g_loss = 0.01
 		self.d_lr = 1e-4
-		self.g_lr = 1.5e-4
-		self.gan_type = 'WGAN' # choose from 'GAN', 'WGAN' and 'SGAN'
-		self.iter = 8 # number of disc iterations per gen iterations
+		self.g_lr = 1e-4
+		self.iter = args.d_iters # number of disc iterations per gen iterations
 		self.d_decay = False
 		self.g_decay = False
 		self.use_L2_reg = False
 		self.lambda_l2 = 10
-		self.pretrain_steps = 200
 		self.beta1 = 0.5
 		self.discriminator = discriminator
 		self.generator = generator
@@ -78,34 +85,61 @@ class CycleGAN(object):
 			self.test()
 
 	def build_model(self):
+
+		mask = np.zeros((self.image_size, self.image_size))
+		_center = self.image_size/2 - 0.5
+		for i in range(self.image_size):
+			for j in range(self.image_size):
+				if ((i-_center)**2 + (j-_center)**2)>_center**2:
+					mask[i][j] = 1.0
+		mask = mask.reshape((1, self.image_size, self.image_size, 1))
+		self.mask_test = tf.convert_to_tensor(np.repeat(mask,self.test_size,axis=0))
+		self.mask_train = tf.convert_to_tensor(np.repeat(mask,self.batch_size,axis=0))
+		self.edge_test = - tf.ones([self.test_size, self.image_size, self.image_size, 1]) * 1.0
+		self.edge_train = - tf.ones([self.batch_size, self.image_size, self.image_size, 1]) * 1.0
+
 		self.test_A = tf.placeholder(tf.float32,
 								[self.test_size, self.image_size, self.image_size, 1],
 								name='test_A')
-		self.test_fake = self.generator(self.test_A, name='A2B', 
-																			reuse=False, is_training=False)
-		if self.has_paired:
-			edge = - tf.ones(tf.shape(self.test_fake),
-											dtype=self.test_fake.dtype) * 1.0
-			self.test_fake = tf.where(tf.equal(self.test_A, -1.0), 
-																	edge, self.test_fake)
+		#self.test_A = tf.where(tf.equal(self.mask_test, 1.0), self.edge_test, self.test_A)
+
+		code1 = tf.get_variable('g_style_feature1', [1, 32, 32, self.gf_dim*8], initializer=tf.truncated_normal_initializer(stddev=1))
+		code2 = tf.get_variable('g_style_feature2', [1, 32, 32, self.gf_dim*8], initializer=tf.truncated_normal_initializer(stddev=1))
+		self.code_check = tf.reduce_mean(code2**2)
+		content = encoder_content(self.test_A, dim=self.gf_dim, reuse=False, is_training=False)
+		style = encoder_style(self.test_A, dim=self.gf_dim, reuse=False, is_training=False)
+		self.test_fake = generator(content, code2, dim=self.gf_dim, is_training=False, reuse=False)
+		self.test_fake_cmp = generator(content, style, dim=self.gf_dim, is_training=False, reuse=True)
+
+		#self.test_fake = tf.where(tf.equal(self.mask_test, 1.0), self.edge_test, self.test_fake)
+		#self.test_fake_cmp = tf.where(tf.equal(self.mask_test, 1.0), self.edge_test, self.test_fake_cmp)
 		self.test_fake = tf.round(self.test_fake*self.window_width/2)+self.window_center
+		self.test_fake_cmp = tf.round(self.test_fake_cmp*self.window_width/2)+self.window_center
 
 		if self.has_paired:
 			self.test_B = tf.placeholder(tf.float32,
 									[self.test_size, self.image_size, self.image_size, 1],
 									name='test_B')
-			self.test_fake = (self.test_fake-self.window_center)/self.window_width*2
+			#self.test_B = tf.where(tf.equal(self.mask_test, 1.0), self.edge_test, self.test_B)
+			self.test_fake_p = (self.test_fake-self.window_center)/self.window_width*2
+			self.test_fake_cmp_p = (self.test_fake_cmp-self.window_center)/self.window_width*2
 			self.test_original_mse = self.loss(self.test_B,self.test_A)
 			self.test_original_psnr = tf.reduce_mean(tf.image.psnr(
 																self.test_B+1,self.test_A+1,max_val=2.0))
 			self.test_original_ssim = tf.reduce_mean(tf.image.ssim(
 																self.test_B+1,self.test_A+1,max_val=2.0))
 
-			self.test_transfer_mse = self.loss(self.test_fake,self.test_B)
+			self.test_transfer_mse = self.loss(self.test_fake_p,self.test_B)
 			self.test_transfer_psnr = tf.reduce_mean(tf.image.psnr(
-																self.test_fake+1,self.test_B+1,max_val=2.0))
+																self.test_fake_p+1,self.test_B+1,max_val=2.0))
 			self.test_transfer_ssim = tf.reduce_mean(tf.image.ssim(
-																self.test_fake+1,self.test_B+1,max_val=2.0))
+																self.test_fake_p+1,self.test_B+1,max_val=2.0))
+
+			self.test_cmp_mse = self.loss(self.test_fake_cmp_p,self.test_B)
+			self.test_cmp_psnr = tf.reduce_mean(tf.image.psnr(
+																self.test_fake_cmp_p+1,self.test_B+1,max_val=2.0))
+			self.test_cmp_ssim = tf.reduce_mean(tf.image.ssim(
+																self.test_fake_cmp_p+1,self.test_B+1,max_val=2.0))
 
 		if self.is_train:
 			self.real_A = tf.placeholder(tf.float32,
@@ -114,94 +148,104 @@ class CycleGAN(object):
 			self.real_B = tf.placeholder(tf.float32,
 											[self.batch_size, self.fine_size, self.fine_size, 1],
 											name='real_B')
+
+			self.real_A_ = tf.placeholder(tf.float32,
+											[self.batch_size, self.fine_size, self.fine_size, 1],
+											name='real_A_')
+			self.real_B_ = tf.placeholder(tf.float32,
+											[self.batch_size, self.fine_size, self.fine_size, 1],
+											name='real_B_')
+			#self.real_A = tf.where(tf.equal(self.mask_train, 1.0), self.edge_train, self.real_A)
+			#self.real_B = tf.where(tf.equal(self.mask_train, 1.0), self.edge_train, self.real_B)
+			#self.real_A_ = tf.where(tf.equal(self.mask_train, 1.0), self.edge_train, self.real_A_)
+			#self.real_B_ = tf.where(tf.equal(self.mask_train, 1.0), self.edge_train, self.real_B_)
+
+			self.real_c_a = encoder_content(self.real_A, dim=self.gf_dim, reuse=True, is_training=True)
+			self.real_c_b = encoder_content(self.real_B, dim=self.gf_dim, reuse=True, is_training=True)
+			self.real_s_a = encoder_style(self.real_A, dim=self.gf_dim, reuse=True, is_training=True)
+			self.real_s_b = encoder_style(self.real_B, dim=self.gf_dim, reuse=True, is_training=True)
+			self.fake_A = generator(self.real_c_a, self.real_s_a, dim=self.gf_dim, is_training=True, reuse=True)
+			self.fake_B = generator(self.real_c_b, self.real_s_b, dim=self.gf_dim, is_training=True, reuse=True)
+			self._fake_B = generator(self.real_c_a, self.real_s_b, dim=self.gf_dim, is_training=True, reuse=True)
+			self._fake_A = generator(self.real_c_b, self.real_s_a, dim=self.gf_dim, is_training=True, reuse=True)
+			#self.fake_A = tf.where(tf.equal(self.mask_train, 1.0), self.edge_train, self.fake_A)
+			#self.fake_B = tf.where(tf.equal(self.mask_train, 1.0), self.edge_train, self.fake_B)
+			#self._fake_A = tf.where(tf.equal(self.mask_train, 1.0), self.edge_train, self._fake_A)
+			#self._fake_B = tf.where(tf.equal(self.mask_train, 1.0), self.edge_train, self._fake_B)
 			
-			self.fake_B = self.generator(self.real_A, name='A2B', reuse=True)
-			self.fake_A_ = self.generator(self.fake_B, name='B2A', reuse=False)
-			self.fake_A = self.generator(self.real_B, name='B2A', reuse=True)
-			self.fake_B_ = self.generator(self.fake_A, name='A2B', reuse=True)
+			self.fake_c_a = encoder_content(self._fake_B, dim=self.gf_dim, reuse=True, is_training=True)
+			self.fake_c_b = encoder_content(self._fake_A, dim=self.gf_dim, reuse=True, is_training=True)
+			self.cc_fake_A = generator(self.fake_c_a, self.real_s_a, dim=self.gf_dim, is_training=True, reuse=True)
+			self.cc_fake_B = generator(self.fake_c_b, self.real_s_b, dim=self.gf_dim, is_training=True, reuse=True)
+			
+			self.code_loss1 = self.loss(self.real_s_b, code1)
+			self.var1 = self.loss(self.real_s_a, code1)
+			self.code_loss_n1 = self.code_loss1/self.var1
+			self.code_loss_n1 *= self.w_c
 
-			self.mse_a = self.loss(self.fake_A_,self.real_A)
-			self.mse_b = self.loss(self.fake_B_,self.real_B)
+			self.code_loss2 = self.loss(self.real_s_b, code2)
+			self.var2 = self.loss(self.real_s_a, code2)
+			self.code_loss_n2 = self.code_loss2/self.var2
+			self.code_loss_n2 *= self.w_c
 
-			self.DB_fake = self.discriminator(self.fake_B, reuse=False, name="DB")
- 			self.DA_fake = self.discriminator(self.fake_A, reuse=False, name="DA")
+			self.rec_a = self.loss(self.fake_A, self.real_A)
+			self.rec_b = self.loss(self.fake_B, self.real_B)
+			self.g_loss_rec =  self.rec_a + self.rec_b
+			self.g_loss_rec *= self.w_rec
+			
+			self.cc_a = self.loss(self.cc_fake_A, self.real_A)
+			self.cc_b = self.loss(self.cc_fake_B, self.real_B)
+			self.g_loss_cc =  self.cc_a + self.cc_b
+			self.g_loss_cc *= self.w_cc
+			
+			self.trans_a = self.loss(self._fake_A, self.real_A)
+			self.trans_b = self.loss(self._fake_B, self.real_B)
+			self.g_loss_trans =  self.trans_a + self.trans_b
+			self.g_loss_trans *= self.w_trans
+			'''
+			self.content_a = self.loss(self.real_c_a, self.fake_c_a)
+			self.content_b = self.loss(self.real_c_b, self.fake_c_b)
+			self.content_loss = self.content_a + self.content_b
+			self.content_loss *= 0
+			'''
 
-			self.DB_real = self.discriminator(self.real_B, reuse=True, name="DB")
-			self.DA_real = self.discriminator(self.real_A, reuse=True, name="DA")
-
-			self.g_loss_mse =  self.lambda_cc_loss * (self.mse_a + self.mse_b)
-			self.db_loss_real = gan_loss(self.DB_real, 
-																				tf.ones_like(self.DB_real))
-			self.da_loss_real = gan_loss(self.DA_real, 
-																				tf.ones_like(self.DA_real))
-
-			# pre-training losses
-			self.g_loss_p = self.loss(self.fake_B, self.real_A) \
-											+ self.loss(self.fake_A, self.real_B)
-			self.g_loss_p *= self.lambda_cc_loss
-			self.DA2B_real = self.discriminator(self.real_A, reuse=True, name="DB")
-			self.DB2A_real = self.discriminator(self.real_B, reuse=True, name="DA")
-			self.d_loss_p = self.db_loss_real + self.da_loss_real \
-				+ gan_loss(self.DA2B_real, tf.zeros_like(self.DA2B_real)) \
-				+ gan_loss(self.DB2A_real, tf.zeros_like(self.DB2A_real))
-
-
-			if self.gan_type == 'WGAN':
+			if self.iter > 0:
+				self.DB_fake = self.discriminator(tf.concat([self.fake_B,self.real_B_],3), reuse=False)
+				self.DB_real = self.discriminator(tf.concat([self.real_B,self.real_B_],3), reuse=True)
+				self.DA_fake = self.discriminator(tf.concat([self.fake_A,self.real_A_],3), reuse=True)
+				self.DA_real = self.discriminator(tf.concat([self.real_A,self.real_A_],3), reuse=True)
 				self.db_loss = tf.reduce_mean(self.DB_fake - self.DB_real)
 				self.da_loss = tf.reduce_mean(self.DA_fake - self.DA_real)
-				self.d_loss_gan = self.da_loss + self.db_loss
-				self.g_loss_gan = -tf.reduce_mean(self.DB_fake + self.DA_fake)
+				self.d_loss_gan = self.db_loss + self.da_loss
+				self.g_loss_gan = -tf.reduce_mean(self.DB_fake+self.DA_fake)
 				self.g_loss_gan *= self.lambda_g_loss
-				self.g_loss_tmp = self.g_loss_gan + self.g_loss_mse
-				self.g_loss = self.g_loss_tmp * (1 + tf.sign(-self.d_loss_gan)) / 2
-
 				alpha = tf.random_uniform(
 								shape=[self.batch_size,1,1,1], minval=0.,maxval=1.)
-				interpolates = alpha*self.real_A + (1-alpha)*self.fake_A
-				disc_interpolates = self.discriminator(
-								interpolates, reuse=True, name="DA")
-				gradients = tf.gradients(disc_interpolates, [interpolates])[0]
-				slopes = tf.sqrt(tf.reduce_sum(
-								tf.square(gradients), reduction_indices=[1]))
-				self.grad_penal_A = self.penalty(slopes)
-
-				alpha = tf.random_uniform(
-								shape=[self.batch_size,1,1,1], minval=0.,maxval=1.)
-				interpolates = alpha*self.real_B + (1.0-alpha)*self.fake_B
-				disc_interpolates = self.discriminator(
-								interpolates, reuse=True, name="DB")
+				interpolates = alpha*self.real_B + (1-alpha)*self._fake_B
+				disc_interpolates = self.discriminator(tf.concat([interpolates,self.real_B_],3), reuse=True)
 				gradients = tf.gradients(disc_interpolates, [interpolates])[0]
 				slopes = tf.sqrt(tf.reduce_sum(
 								tf.square(gradients), reduction_indices=[1]))
 				self.grad_penal_B = self.penalty(slopes)
 
-		 		self.gradient_penalty = self.grad_penal_A + self.grad_penal_B
+				alpha = tf.random_uniform(
+								shape=[self.batch_size,1,1,1], minval=0.,maxval=1.)
+				interpolates = alpha*self.real_A + (1-alpha)*self._fake_A
+				disc_interpolates = self.discriminator(tf.concat([interpolates,self.real_A_],3), reuse=True)
+				gradients = tf.gradients(disc_interpolates, [interpolates])[0]
+				slopes = tf.sqrt(tf.reduce_sum(
+								tf.square(gradients), reduction_indices=[1]))
+				self.grad_penal_A = self.penalty(slopes)
+
+				self.gradient_penalty = self.grad_penal_B + self.grad_penal_A
 				self.d_loss = self.d_loss_gan + self.lambda_gp * self.gradient_penalty
-			else:
-				if self.gan_type == 'GAN':
-					self.gan_loss = gan_loss
-				if self.gan_type == 'SGAN':
-					self.gan_loss = mse_loss
 
-				self.db_loss_fake = self.gan_loss(self.DB_fake, 
-																					tf.zeros_like(self.DB_fake))
-				self.db_loss = self.db_loss_real + self.db_loss_fake
-				self.da_loss_fake = self.gan_loss(self.DA_fake, 
-																					tf.zeros_like(self.DA_fake))
-				self.da_loss = self.da_loss_real + self.da_loss_fake
+			self._w_1 = tf.placeholder(tf.float32, name='w_unsupervised')
+			self._w_2 = tf.placeholder(tf.float32, name='w_supervised')
+			self.g_loss = self.g_loss_rec + \
+										(self.g_loss_cc + self.code_loss_n2) * self._w_1 + \
+										(self.g_loss_trans + self.code_loss_n1) * self._w_2
 
-				self.d_loss = self.da_loss + self.db_loss
-				self.g_loss_gan = self.gan_loss(self.DB_fake, 
-																				tf.ones_like(self.DB_fake)) \
-													+ self.gan_loss(self.DA_fake, 
-																					tf.ones_like(self.DA_fake))
-				self.g_loss = self.g_loss_gan + self.g_loss_mse
-
-			if self.use_L2_reg:
-				self.l2_loss = tf.reduce_mean(self.lambda_l2 *
-													tf.stack([tf.reduce_mean(v ** 2) / 2
-													for v in tf.get_collection('weights')]))
-				self.d_loss += self.l2_loss
 
 		t_vars = tf.trainable_variables()
 		self.g_vars = [var for var in t_vars if 'g_' in var.name]
@@ -218,23 +262,9 @@ class CycleGAN(object):
 		if self.optimizer == 'Adam':
 			g_optim = tf.train.AdamOptimizer(_g_lr, beta1=self.beta1) \
 								.minimize(self.g_loss, var_list=self.g_vars)
-			d_optim = tf.train.AdamOptimizer(_d_lr, beta1=self.beta1) \
-								.minimize(self.d_loss, var_list=self.d_vars)
-
-			g_optim_p = tf.train.AdamOptimizer(_g_lr, beta1=self.beta1) \
-								.minimize(self.g_loss_p, var_list=self.g_vars)
-			d_optim_p = tf.train.AdamOptimizer(_d_lr, beta1=self.beta1) \
-								.minimize(self.d_loss_p, var_list=self.d_vars)
-		if self.optimizer == 'RMSProp':
-			g_optim = tf.train.RMSPropOptimizer(_g_lr, decay=0.95) \
-								.minimize(self.g_loss, var_list=self.g_vars)
-			d_optim = tf.train.RMSPropOptimizer(_d_lr, decay=0.95) \
-								.minimize(self.d_loss, var_list=self.d_vars)
-
-			g_optim_p = tf.train.RMSPropOptimizer(_g_lr, decay=0.95) \
-								.minimize(self.g_loss_p, var_list=self.g_vars)
-			d_optim_p = tf.train.RMSPropOptimizer(_d_lr, decay=0.95) \
-								.minimize(self.d_loss_p, var_list=self.d_vars)
+			if self.iter > 0:
+				d_optim = tf.train.AdamOptimizer(_d_lr, beta1=self.beta1) \
+									.minimize(self.d_loss, var_list=self.d_vars)
 
 		init_op = tf.global_variables_initializer()
 		self.sess.run(init_op)
@@ -249,6 +279,8 @@ class CycleGAN(object):
 
 		data_a = os.path.join(self.dataset_path, self.style_A)
 		data_b = os.path.join(self.dataset_path, self.style_B)
+		data_c = self.style_C
+		data_e = self.style_E
 
 		for epoch in range(self.epoch_num):
 			if self.g_decay:
@@ -260,67 +292,110 @@ class CycleGAN(object):
 				d_lr = self.d_lr * float(self.epoch_num-epoch)/self.epoch_num
 			else:
 				d_lr = self.d_lr
-
+			style_d = np.random.choice(self.style_D)
+			data_d = os.path.join(self.dataset_path, style_d)
 			for it in range(self.epoch_size+1):
+				
+				for p in range(self.num_unsup):
+					batch_files_a = get_batch(data_c, self.batch_size)
+					batch_files_b = get_batch(data_e, self.batch_size)
+					batch_files_a_ = get_batch(data_c, self.batch_size)
+					batch_files_b_ = get_batch(data_e, self.batch_size)
+					batch_images_a = [load_data(batch_file, fine_size=self.fine_size, window_center=self.window_center, window_width=self.window_width) for batch_file in batch_files_a]
+					batch_images_b = [load_data(batch_file, fine_size=self.fine_size, window_center=self.window_center, window_width=self.window_width) for batch_file in batch_files_b]
+					batch_images_a_ = [load_data(batch_file, fine_size=self.fine_size, window_center=self.window_center, window_width=self.window_width) for batch_file in batch_files_a_]
+					batch_images_b_ = [load_data(batch_file, fine_size=self.fine_size, window_center=self.window_center, window_width=self.window_width) for batch_file in batch_files_b_]
 
-				batch_files_a = get_batch(data_a, self.batch_size)
-				batch_files_b = get_batch(data_b, self.batch_size)
-				batch_images_a = [load_data(batch_file, fine_size=self.fine_size, window_center=self.window_center, window_width=self.window_width) for batch_file in batch_files_a]
-				batch_images_b = [load_data(batch_file, fine_size=self.fine_size, window_center=self.window_center, window_width=self.window_width) for batch_file in batch_files_b]
+					if p==0 and np.mod(counter, self.t_print_every) == 0:
+						rec_a, rec_b, code_loss, var, cc_a, cc_b = self.sess.run(
+							[self.rec_a, self.rec_b, self.code_loss2, self.var2,
+							self.cc_a, self.cc_b],
+							feed_dict={self.real_A: batch_images_a, self.real_B: batch_images_b, 
+							self.real_A_: batch_images_a_, self.real_B_: batch_images_b_}
+						)
+						print('')
+						print('-------------------Unsupervised------------------')
+						print("Iteration: %d, Time: %4.1f" \
+										% (counter, time.time() - start_time))
+						print("[Reconstruction]  A: %.4f, B: %.4f" % (rec_a, rec_b))
+						print("[Cycel Consistency]A: %.4f, B: %.4f" % (cc_a, cc_b))
+						#print("[Content Loss] %.6f" % (c_loss))
+						print("[Style Distance]  A: %.4f, B: %.4f" % (var, code_loss))
+						#print("[Discriminator]  Gan loss: %.4f, Gradient Penalty: %.4f" % (d_gan, grad_penal))
 
-				if np.mod(counter, self.t_print_every) == 0:
-					mse_a, mse_b, d_loss, g_loss_gan, g_loss_mse = self.sess.run(
-						[self.mse_a, self.mse_b, self.d_loss,
-						self.g_loss_gan, self.g_loss_mse],
-						feed_dict={self.real_A: batch_images_a,
-						self.real_B: batch_images_b}
-					)
-					print("Iteration: %d"%(counter))
-					print("[Training] A-MSE: %.4f, B-MSE: %.4f" % (mse_a, mse_b))
-					print("[Training] D loss: %.4f, G loss gan: %.4f, G loss mse: %.4f" \
-								% (d_loss, g_loss_gan, g_loss_mse))
+
+					self.sess.run([g_optim], feed_dict={
+						self.real_A: batch_images_a, self.real_B: batch_images_b, 
+						self.real_A_: batch_images_a_, self.real_B_: batch_images_b_, 
+						_g_lr: g_lr, self._w_1: 1.0, self._w_2: 0.0
+					})
+					for t in range(self.iter):
+							self.sess.run([d_optim], feed_dict={
+								self.real_A: batch_images_a, self.real_B: batch_images_b, 
+								self.real_A_: batch_images_a_, self.real_B_: batch_images_b_,
+								_d_lr: d_lr
+							})
+							
+							if t < (self.iter-1):
+								seed = np.random.randint(1000000, size=(self.batch_size, 2))
+								batch_files_a = get_batch(data_c, self.batch_size)
+								batch_files_b = get_batch(data_b, self.batch_size)
+								batch_files_a_ = get_batch(data_c, self.batch_size)
+								batch_files_b_ = get_batch(data_b, self.batch_size)
+								batch_images_a = [load_data(batch_file, fine_size=self.fine_size, window_center=self.window_center, window_width=self.window_width) for batch_file in batch_files_a]
+								batch_images_b = [load_data(batch_file, fine_size=self.fine_size, window_center=self.window_center, window_width=self.window_width) for batch_file in batch_files_b]
+								batch_images_a_ = [load_data(batch_file, fine_size=self.fine_size, window_center=self.window_center, window_width=self.window_width) for batch_file in batch_files_a_]
+								batch_images_b_ = [load_data(batch_file, fine_size=self.fine_size, window_center=self.window_center, window_width=self.window_width) for batch_file in batch_files_b_]
+
+
+
+				for q in range(self.num_sup):
+					seed = np.random.randint(1000000, size=(self.batch_size, 2))
+					batch_files_a = get_batch(data_d, self.batch_size, seed=seed)
+					batch_files_b = get_batch(data_b, self.batch_size, seed=seed)
+					batch_images_a = [load_data(batch_file, fine_size=self.fine_size, window_center=self.window_center, window_width=self.window_width) for batch_file in batch_files_a]
+					batch_images_b = [load_data(batch_file, fine_size=self.fine_size, window_center=self.window_center, window_width=self.window_width) for batch_file in batch_files_b]
+
+
+					if q==0 and np.mod(counter, self.t_print_every) == 0:
+						rec_a, rec_b, code_loss, var, trans_a, trans_b = self.sess.run(
+							[self.rec_a, self.rec_b, self.code_loss1, self.var1,
+							self.trans_a, self.trans_b],
+							feed_dict={self.real_A: batch_images_a, self.real_B: batch_images_b, 
+							self.real_A_: batch_images_a, self.real_B_: batch_images_b}
+						)
+						print('')
+						print('--------------------Supervised-------------------')
+						print("Iteration: %d, Time: %4.1f" \
+										% (counter, time.time() - start_time))
+						print("[Reconstruction]  A: %.4f, B: %.4f" % (rec_a, rec_b))
+						print("[Transfer]  A: %.4f, B: %.4f" % (trans_a, trans_b))
+						#print("[Content Loss] %.6f" % (c_loss))
+						print("[Style Distance]  A: %.4f, B: %.4f" % (var, code_loss))
+
+
+					self.sess.run([g_optim], feed_dict={
+						self.real_A: batch_images_a, self.real_B: batch_images_b, 
+						self.real_A_: batch_images_a, self.real_B_: batch_images_b, 
+						_g_lr: g_lr, self._w_1: 0.0, self._w_2: 1.0
+					})
+
 
 				if self.has_paired:
 					if np.mod(counter, self.v_print_every) == 0:
 						self.val(epoch, it)
-						print("Iteration: %d, Time: %4.1f" \
-									% (counter, time.time() - start_time))
 
 				if np.mod(counter, self.save_every) == 0:
 					self.save(counter)
 					print('Check point saved in %s' %(self.checkpoint_dir))
 
-				
-				if counter < self.pretrain_steps:
-					self.sess.run([g_optim_p], feed_dict={
-						self.real_A: batch_images_a, self.real_B: batch_images_b, _g_lr: g_lr
-					})
-					self.sess.run([d_optim_p], feed_dict={
-						self.real_A: batch_images_a, self.real_B: batch_images_b, _d_lr: d_lr
-					})
-				
-				else:
-					self.sess.run([g_optim], feed_dict={
-						self.real_A: batch_images_a, self.real_B: batch_images_b, _g_lr: g_lr 
-					})
-					for t in range(self.iter):
-						self.sess.run([d_optim], feed_dict={
-							self.real_A: batch_images_a, self.real_B: batch_images_b, _d_lr: d_lr 
-						})
-						
-						if t < (self.iter-1):
-							batch_files_a = get_batch(data_a, self.batch_size)
-							batch_files_b = get_batch(data_b, self.batch_size)
-							batch_images_a = [load_data(batch_file, fine_size=self.fine_size, window_center=self.window_center, window_width=self.window_width) for batch_file in batch_files_a]
-							batch_images_b = [load_data(batch_file, fine_size=self.fine_size, window_center=self.window_center, window_width=self.window_width) for batch_file in batch_files_b]
 
 				counter += 1		
 
 	def load_random_sample(self):
 		path_a = os.path.join(self.dataset_path, self.style_A)
 		path_b = os.path.join(self.dataset_path, self.style_B)
-		file_a, file_b = get_batch_paired(path_a, path_b, has_seed=True, seed=0)
-		print(file_a)
+		file_a, file_b = get_batch_paired(path_a, path_b, has_seed=True, seed=self.val_seed)
 		img_a = load_data(file_a, is_train=False, window_center=self.window_center, window_width=self.window_width)
 		img_b = load_data(file_b, is_train=False, window_center=self.window_center, window_width=self.window_width)
 		size = img_a.shape[0]
@@ -334,16 +409,19 @@ class CycleGAN(object):
 		if not os.path.exists(sample_dir):
 			os.makedirs(sample_dir)
 
-		out_img, o_mse, o_psnr, o_ssim, t_mse, t_psnr, t_ssim = self.sess.run(
-			[self.test_fake, self.test_original_mse, self.test_original_psnr,
-			self.test_original_ssim, self.test_transfer_mse, 
-			self.test_transfer_psnr, self.test_transfer_ssim],
+		out_img, o_mse, o_psnr, o_ssim, t_mse, t_psnr, t_ssim, c_mse, c_psnr, c_ssim = self.sess.run(
+			[self.test_fake_p, self.test_original_mse, self.test_original_psnr,self.test_original_ssim,
+			self.test_transfer_mse, self.test_transfer_psnr, self.test_transfer_ssim,
+			self.test_cmp_mse, self.test_cmp_psnr, self.test_cmp_ssim],
 			feed_dict={self.test_A: sample_a, self.test_B: sample_b}
 		)
-		print("[Validation]Original--MSE: %.4f, PSNR: %.4f, SSIM: %.4f" \
+		print('')
+		print("[Validation]  Original--MSE: %.4f, PSNR: %.4f, SSIM: %.4f" \
 			% (o_mse, o_psnr, o_ssim))
-		print("[Validation]Transfer--MSE: %.4f, PSNR: %.4f, SSIM: %.4f" \
+		print("[Validation]  Transfer--MSE: %.4f, PSNR: %.4f, SSIM: %.4f" \
 			% (t_mse, t_psnr, t_ssim))
+		print("[Validation]  Comparison--MSE: %.4f, PSNR: %.4f, SSIM: %.4f" \
+			% (c_mse, c_psnr, c_ssim))
 		save_png(out_img, '{}/train_{:02d}_{:04d}.png'.format(sample_dir, epoch, idx))
 		if epoch == 0 and idx == 0:
 			save_png(sample_a, '{}/A.png'.format(sample_dir))
@@ -386,6 +464,8 @@ class CycleGAN(object):
 		if not os.path.exists(self.out_dir):
 			os.makedirs(self.out_dir)
 
+		code_check = self.sess.run(self.code_check)
+		print(code_check)
 		data_a = os.path.join(self.dataset_path, self.style_A)
 		data_b = os.path.join(self.dataset_path, self.style_B)
 		if self.has_paired:
@@ -396,6 +476,7 @@ class CycleGAN(object):
 			ssim_1 = 0
 			ssim_2 = 0
 		folders = os.listdir(data_a)
+		count = 0
 		for folder in folders:
 			print('Processing patient: -----%s-----'%(folder))
 			folder_out = os.path.join(self.out_dir, folder)
@@ -406,55 +487,58 @@ class CycleGAN(object):
 				folder_b = os.path.join(data_b, folder)
 			imgs = os.listdir(folder_a)
 			for img in imgs:
+				count += 1
 				img_out = os.path.join(folder_out, img)
 				img_a = os.path.join(folder_a, img)
 				dicom_a = dicom.read_file(img_a)
-				pixels_a = dicom_a.pixel_array
-				pixels_a_origin = pixels_a.astype('float32') * dicom_a.RescaleSlope \
-									+ dicom_a.RescaleIntercept
-				pixels_a = np.reshape(pixels_a_origin,(1, self.image_size, self.image_size, 1))
-				pixels_a = (pixels_a-self.window_center)/self.window_width*2
-				pixels_a[pixels_a<-1.0] = -1.0
-				pixels_a[pixels_a>1.0] = 1.0
-				if not self.has_paired:
-					image = self.sess.run(self.test_fake, feed_dict={self.test_A: pixels_a})
-				else:
-					img_b = os.path.join(folder_b, img)
-					dicom_b = dicom.read_file(img_b)
-					pixels_b = dicom_b.pixel_array
-					pixels_b = pixels_b.astype('float32') * dicom_b.RescaleSlope \
-										+ dicom_b.RescaleIntercept
-					pixels_b = np.reshape(pixels_b,(1, self.image_size, self.image_size, 1))
-					pixels_b = (pixels_b-self.window_center)/self.window_width*2
-					pixels_b[pixels_b<-1.0] = -1.0
-					pixels_b[pixels_b>1.0] = 1.0
-					image, o_mse, o_psnr, o_ssim, t_mse, t_psnr, t_ssim = self.sess.run([
-							self.test_fake, self.test_original_mse, self.test_original_psnr,
-							self.test_original_ssim, self.test_transfer_mse, 
-							self.test_transfer_psnr,self.test_transfer_ssim],
-							feed_dict={self.test_A: pixels_a, self.test_B: pixels_b})
-					mse_1 += o_mse
-					mse_2 += t_mse
-					psnr_1 += o_psnr
-					psnr_2 += t_psnr
-					ssim_1 += o_ssim
-					ssim_2 += t_ssim
-				image = np.reshape(image,(self.image_size, self.image_size))
-				#pixels_a_origin = np.reshape(pixels_a_origin,(self.image_size, self.image_size))
-				#image[pixels_a_origin<-1500] = -1500
-				#image[pixels_a_origin>400] = 400
-				image = (image - dicom_a.RescaleIntercept) / dicom_a.RescaleSlope
-				image = image.astype('uint16')
-				dicom_a.PixelData = image.tostring()
-				dicom_a.save_as(img_out)
+				try:
+					pixels_a = dicom_a.pixel_array
+					pixels_a_origin = pixels_a.astype('float32') * dicom_a.RescaleSlope \
+										+ dicom_a.RescaleIntercept
+					pixels_a = np.reshape(pixels_a_origin,(1, self.image_size, self.image_size, 1))
+					pixels_a = (pixels_a-self.window_center)/self.window_width*2
+					pixels_a[pixels_a<-1.0] = -1.0
+					pixels_a[pixels_a>1.0] = 1.0
+					if not self.has_paired:
+						image = self.sess.run(self.test_fake, feed_dict={self.test_A: pixels_a})
+					else:
+						img_b = os.path.join(folder_b, img)
+						dicom_b = dicom.read_file(img_b)
+						pixels_b = dicom_b.pixel_array
+						pixels_b = pixels_b.astype('float32') * dicom_b.RescaleSlope \
+											+ dicom_b.RescaleIntercept
+						pixels_b = np.reshape(pixels_b,(1, self.image_size, self.image_size, 1))
+						pixels_b = (pixels_b-self.window_center)/self.window_width*2
+						pixels_b[pixels_b<-1.0] = -1.0
+						pixels_b[pixels_b>1.0] = 1.0
+						image, o_mse, o_psnr, o_ssim, t_mse, t_psnr, t_ssim = self.sess.run([
+								self.test_fake, self.test_original_mse, self.test_original_psnr,
+								self.test_original_ssim, self.test_transfer_mse, 
+								self.test_transfer_psnr,self.test_transfer_ssim],
+								feed_dict={self.test_A: pixels_a, self.test_B: pixels_b})
+						mse_1 += o_mse
+						mse_2 += t_mse
+						psnr_1 += o_psnr
+						psnr_2 += t_psnr
+						ssim_1 += o_ssim
+						ssim_2 += t_ssim
+					image = np.reshape(image,(self.image_size, self.image_size))
+					image[image<-1024]=-1024
+					image = (image - dicom_a.RescaleIntercept) / dicom_a.RescaleSlope
+					image = image.astype('uint16')
+					dicom_a.PixelData = image.tostring()
+					dicom_a.save_as(img_out)
+				except (TypeError,AttributeError), e:
+					print(img_a)
+					print(e)
 
 		if self.has_paired:
-			mse_1 /= len(sample_files)
-			mse_2 /= len(sample_files)
-			psnr_1 /= len(sample_files)
-			psnr_2 /= len(sample_files)
-			ssim_1 /= len(sample_files)
-			ssim_2 /= len(sample_files)
+			mse_1 /= count
+			mse_2 /= count
+			psnr_1 /= count
+			psnr_2 /= count
+			ssim_1 /= count
+			ssim_2 /= count
 			print("Original--MSE: %.4f, PSNR: %.4f, SSIM: %.4f" \
 				% (mse_1, psnr_1, ssim_1))
 			print("Transfer--MSE: %.4f, PSNR: %.4f, SSIM: %.4f" \
